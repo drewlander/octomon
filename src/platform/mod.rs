@@ -908,38 +908,92 @@ mod linux {
     /// Live signal from `/proc/net/wireless`, which the kernel exposes to any
     /// user — no `iw`, no netlink, no privilege. Column 3 is the signal level in
     /// dBm and column 4 the noise floor.
-    pub fn wifi_signal() -> Option<WifiSignal> {
-        let text = std::fs::read_to_string("/proc/net/wireless").ok()?;
-        parse_proc_wireless(&text)
-    }
+   use std::process::Command;
 
-    fn parse_proc_wireless(text: &str) -> Option<WifiSignal> {
-        // Two header lines, then one row per interface.
-        for line in text.lines().skip(2) {
-            let Some((_iface, rest)) = line.split_once(':') else {
-                continue;
-            };
-            let f: Vec<&str> = rest.split_whitespace().collect();
-            if f.len() < 4 {
-                continue;
-            }
-            // Values carry a trailing '.' ("-40.") and are floats in the spec.
-            let num = |s: &str| s.trim_end_matches('.').parse::<f64>().ok();
-            let (Some(level), Some(noise)) = (num(f[2]), num(f[3])) else {
-                continue;
-            };
-            if level == 0.0 {
-                continue; // not associated
-            }
-            return Some(WifiSignal {
-                rssi_dbm: level as i32,
-                noise_dbm: Some(noise as i32),
-                // /proc/net/wireless has no bitrate; filled in by wifi_details.
-                tx_rate_mbps: 0.0,
-            });
-        }
-        None
+pub fn wifi_signal() -> Option<WifiSignal> {
+    let ifaces = iw(&["dev"]).map(|t| parse_iw_interfaces(&t))?;
+    for iface in ifaces {
+        let Some(link) = iw(&["dev", &iface, "link"]) else { continue };
+        let Some((rssi, tx_rate)) = parse_iw_link_signal(&link) else { continue };
+
+        // Noise isn't in `link`; the survey is best-effort (driver-dependent).
+        let noise = iw(&["dev", &iface, "survey", "dump"])
+            .and_then(|t| parse_iw_noise(&t));
+
+        return Some(WifiSignal {
+            rssi_dbm: rssi,
+            noise_dbm: noise,
+            tx_rate_mbps: tx_rate,
+        });
     }
+    None
+}
+
+/// Run `iw` with a C locale. `iw` is often in /usr/sbin, which isn't on
+/// PATH for normal users on Debian/Ubuntu, so try those paths too.
+fn iw(args: &[&str]) -> Option<String> {
+    for bin in ["iw", "/usr/sbin/iw", "/sbin/iw"] {
+        match Command::new(bin).args(args).env("LC_ALL", "C").output() {
+            Ok(out) if out.status.success() => {
+                return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+            }
+            Ok(_) => return None,   // iw exists but the command failed
+            Err(_) => continue,     // binary not found here, try the next path
+        }
+    }
+    None
+}
+
+/// `iw dev` lines look like "\tInterface wlan0".
+fn parse_iw_interfaces(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("Interface "))
+        .map(|s| s.trim().to_string())
+        .collect()
+}
+
+/// `iw dev <if> link` when associated:
+///   signal: -52 dBm
+///   tx bitrate: 780.0 MBit/s VHT-MCS 9 ...
+/// When not associated it prints "Not connected." and has no signal line.
+fn parse_iw_link_signal(text: &str) -> Option<(i32, f64)> {
+    let mut signal = None;
+    let mut tx_rate = 0.0;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("signal:") {
+            signal = v.split_whitespace().next()?.parse::<f64>().ok().map(|s| s as i32);
+        } else if let Some(v) = line.strip_prefix("tx bitrate:") {
+            tx_rate = v
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+        }
+    }
+    signal.map(|s| (s, tx_rate))
+}
+
+/// `iw dev <if> survey dump` has one block per channel; the one we want
+/// is marked "[in use]":
+///   frequency:   5180 MHz [in use]
+///   noise:       -95 dBm
+fn parse_iw_noise(text: &str) -> Option<i32> {
+    let mut in_use = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("Survey data from") {
+            in_use = false;
+        } else if let Some(v) = line.strip_prefix("frequency:") {
+            in_use = v.contains("[in use]");
+        } else if in_use {
+            if let Some(v) = line.strip_prefix("noise:") {
+                return v.split_whitespace().next()?.parse::<f64>().ok().map(|n| n as i32);
+            }
+        }
+    }
+    None
+} 
 
     /// The DHCP server of the current v4 lease, from whichever lease store
     /// this distribution keeps: systemd-networkd's per-index lease file
