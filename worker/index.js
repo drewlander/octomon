@@ -1,7 +1,8 @@
 // octomon.dev: static site from ./website (served by the assets pipeline
-// before this worker runs), /apt/* read from the octomon-apt R2 bucket —
-// the Debian repository CI publishes into (.github/workflows/deb.yml) —
-// and /edge, the one endpoint the octomon client itself calls.
+// before this worker runs), /apt/* and /rpm/* read from the octomon-apt R2
+// bucket — the package repositories CI publishes into
+// (.github/workflows/packages.yml) — and /edge, the one endpoint the
+// octomon client itself calls.
 //
 // /edge privacy contract (see the site's /privacy page, which is the public
 // face of this promise): the handler is pure request→response. It reads
@@ -27,6 +28,17 @@ function versionOf(ua) {
 // which lets the /privacy graph estimate how much octomon ran without any
 // identifier (refreshes per day ÷ 4 ≈ hours of octomon running that day).
 const WHYS = new Set(["start", "netchange", "refresh"]);
+// The builds octomon ships, as octomon names its own (`plat=` on the call).
+// A fixed set, like the reasons: anything else is counted as "", so the
+// record can never carry a finer detail than these six.
+const PLATS = new Set([
+  "macos-arm64",
+  "macos-x64",
+  "windows-x64",
+  "windows-arm64",
+  "linux-x64",
+  "linux-arm64",
+]);
 
 // The colo's own city ("MIA" → "Miami"): a snapshot of Cloudflare's PoP
 // list (cloudflarestatus.com components, 341 codes). Static on purpose —
@@ -74,15 +86,17 @@ async function edgeAnswer(request, url, env, ctx) {
     ts: Math.floor(Date.now() / 1000),
   };
   if (env.EDGE_STATS) {
-    // The whole record: version, reason, one count. This is the entire
-    // input to the graph on /privacy.
+    // The whole record: version, reason, platform, one count. This is the
+    // entire input to the graphs on /privacy.
     const whyParam = url.searchParams.get("why");
+    const platParam = url.searchParams.get("plat");
     ctx.waitUntil(
       Promise.resolve(
         env.EDGE_STATS.writeDataPoint({
           blobs: [
             versionOf(request.headers.get("user-agent")),
             WHYS.has(whyParam) ? whyParam : "",
+            PLATS.has(platParam) ? platParam : "",
           ],
           doubles: [1],
         }),
@@ -97,59 +111,137 @@ async function edgeAnswer(request, url, env, ctx) {
   });
 }
 
-// The public aggregate behind the /privacy graph: daily request counts per
-// octomon version for the last 30 days, queried from Analytics Engine and
-// cached for an hour. Day buckets keep it coarse in time; the version names
-// a public software build, not a person.
-async function edgeStats(env) {
+// The public aggregate behind the /privacy graphs: daily request counts per
+// octomon version, reason and platform for the last 30 days, queried from
+// Analytics Engine. Day buckets keep it coarse in time; the version and the
+// platform name a public software build, not a person.
+//
+// The query runs on AE_QUERY_TOKEN, and the endpoint is public, so the
+// answer is memoized in the isolate like latestVersion() (same reasoning
+// for not using the Cache API). The response's cache-control header does
+// NOT do this job: Cloudflare runs a Worker before its cache, and
+// wrangler.jsonc doesn't opt the Worker's own responses into caching — so
+// without the memo every hit on /edge/stats would spend the token's quota.
+// A good answer is kept for an hour; a failed query only for a minute, so a
+// hiccup neither sticks for the hour nor lets a burst of requests retry
+// upstream each time, and the last good series keeps being served
+// meanwhile. While one request's refresh is running, others serve the memo
+// as it stands rather than awaiting that request's promise: Workers ties
+// I/O to the request that started it, and a promise shared across requests
+// can be left unsettled for good if its owner is cancelled. The refresh is
+// bounded by a timeout and kept alive with waitUntil, so a client that
+// disconnects mid-query can't wedge the memo either. A refresh that settles
+// after a newer one has landed is dropped. An answer served while the
+// last completed refresh had failed says so with `stale: true`, so the page
+// can tell "failing" from "no data yet"; one served with nothing in the
+// memo yet, because a refresh is still running, says `pending: true`, so
+// the page can tell "loading" from either. Merely past the hour with a
+// refresh in flight is neither: the last good answer is served as is. The
+// memo holds only the aggregate every caller gets anyway — nothing about
+// who asked.
+const STATS_TTL_MS = 60 * 60 * 1000;
+const STATS_FAIL_TTL_MS = 60 * 1000;
+const STATS_QUERY_TIMEOUT_MS = 10 * 1000;
+let statsMemo = { series: [], ok: false, at: 0 };
+// Whether the last refresh to complete failed: that, not the memo's age, is
+// what makes an answer stale.
+let statsFailed = false;
+// When the running refresh started, 0 when none is. Stale after the timeout,
+// so a refresh that never reports back only delays the next one.
+let statsRefreshing = 0;
+// When the refresh whose answer is in the memo started.
+let statsFrom = 0;
+
+async function queryEdgeStats(env) {
+  const sql = `
+    SELECT toStartOfInterval(timestamp, INTERVAL '1' DAY) AS day,
+           blob1 AS version,
+           blob2 AS why,
+           blob3 AS platform,
+           sum(_sample_interval * double1) AS calls
+    FROM octomon_edge
+    WHERE timestamp > now() - INTERVAL '30' DAY
+    GROUP BY day, version, why, platform
+    ORDER BY day, version, why, platform`;
+  try {
+    const resp = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/analytics_engine/sql`,
+      {
+        method: "POST",
+        headers: { authorization: `Bearer ${env.AE_QUERY_TOKEN}` },
+        body: sql,
+        signal: AbortSignal.timeout(STATS_QUERY_TIMEOUT_MS),
+      },
+    );
+    // Only the upstream status or error goes to the log (visible in
+    // `wrangler tail`; Workers Logs stay off): nothing about the caller.
+    if (!resp.ok) {
+      console.error(`edge stats: Analytics Engine answered ${resp.status}`);
+      return { series: [], ok: false, at: Date.now() };
+    }
+    const data = await resp.json();
+    // A 200 without rows is not an empty graph to keep for an hour.
+    if (!Array.isArray(data?.data)) {
+      console.error("edge stats: Analytics Engine answer has no data array");
+      return { series: [], ok: false, at: Date.now() };
+    }
+    const series = data.data.map((r) => ({
+      day: r.day,
+      version: r.version,
+      why: r.why ?? "",
+      platform: r.platform ?? "",
+      calls: Math.round(Number(r.calls) || 0),
+    }));
+    return { series, ok: true, at: Date.now() };
+  } catch (e) {
+    console.error(`edge stats: ${e}`);
+    return { series: [], ok: false, at: Date.now() };
+  }
+}
+
+async function edgeStats(env, ctx) {
   if (!env.AE_QUERY_TOKEN || !env.CF_ACCOUNT_ID) {
     return new Response(JSON.stringify({ series: [] }) + "\n", {
       headers: { "content-type": "application/json; charset=utf-8" },
     });
   }
-  const sql = `
-    SELECT toStartOfInterval(timestamp, INTERVAL '1' DAY) AS day,
-           blob1 AS version,
-           blob2 AS why,
-           sum(_sample_interval * double1) AS calls
-    FROM octomon_edge
-    WHERE timestamp > now() - INTERVAL '30' DAY
-    GROUP BY day, version, why
-    ORDER BY day, version, why`;
-  const resp = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/analytics_engine/sql`,
-    {
-      method: "POST",
-      headers: { authorization: `Bearer ${env.AE_QUERY_TOKEN}` },
-      body: sql,
-    },
-  );
-  if (!resp.ok) {
-    return new Response(JSON.stringify({ series: [] }) + "\n", {
-      status: 200,
-      headers: { "content-type": "application/json; charset=utf-8" },
+  const now = Date.now();
+  const ttl = statsMemo.ok ? STATS_TTL_MS : STATS_FAIL_TTL_MS;
+  if (now - statsMemo.at >= ttl && now - statsRefreshing >= STATS_QUERY_TIMEOUT_MS) {
+    statsRefreshing = now;
+    const started = now;
+    const refresh = queryEdgeStats(env).then((m) => {
+      if (started >= statsFrom) {
+        statsMemo = m.ok ? m : { ...m, series: statsMemo.series };
+        statsFrom = started;
+        statsFailed = !m.ok;
+      }
+      if (statsRefreshing === started) statsRefreshing = 0;
     });
+    ctx.waitUntil(refresh);
+    await refresh;
   }
-  const data = await resp.json();
-  const series = (data.data ?? []).map((r) => ({
-    day: r.day,
-    version: r.version,
-    why: r.why ?? "",
-    calls: Math.round(Number(r.calls) || 0),
-  }));
-  return new Response(JSON.stringify({ series }) + "\n", {
+  const fresh = statsMemo.ok && Date.now() - statsMemo.at < STATS_TTL_MS;
+  const body = { series: statsMemo.series };
+  if (statsFailed) body.stale = true;
+  else if (statsFrom === 0) body.pending = true;
+  return new Response(JSON.stringify(body) + "\n", {
     headers: {
       "content-type": "application/json; charset=utf-8",
-      // One aggregate an hour is plenty; the cache also shields the API
-      // token path from being hammered through the public page.
-      "cache-control": "public, max-age=3600",
+      // For browsers only (see above). Anything but a fresh good series must
+      // not be held on to.
+      "cache-control": fresh ? "public, max-age=3600" : "no-store",
     },
   });
 }
 
 const TYPES = {
   ".deb": "application/vnd.debian.binary-package",
+  ".rpm": "application/x-rpm",
   ".gz": "application/gzip",
+  ".xz": "application/x-xz",
+  ".zst": "application/zstd",
+  ".xml": "application/xml",
   ".gpg": "application/pgp-keys",
   ".asc": "application/pgp-signature",
 };
@@ -157,10 +249,15 @@ const TYPES = {
 function contentType(key) {
   const dot = key.lastIndexOf(".");
   const ext = dot >= 0 ? key.slice(dot) : "";
-  // Release/InRelease/Packages and anything unrecognised: plain text is what
-  // apt expects to fetch, and octet-stream would still work.
+  // Release/InRelease/Packages, the .repo file and anything unrecognised:
+  // plain text is what apt and dnf expect to fetch, and octet-stream would
+  // still work.
   return TYPES[ext] ?? "text/plain; charset=utf-8";
 }
+
+// The package repositories: URL prefix → bucket prefix. Both trees live in
+// one bucket under their own top-level folder.
+const REPOS = ["apt", "rpm"];
 
 export default {
   async fetch(request, env, ctx) {
@@ -169,13 +266,14 @@ export default {
       return await edgeAnswer(request, url, env, ctx);
     }
     if (url.pathname === "/edge/stats") {
-      return edgeStats(env);
+      return edgeStats(env, ctx);
     }
-    if (!url.pathname.startsWith("/apt/")) {
+    const repo = REPOS.find((r) => url.pathname.startsWith(`/${r}/`));
+    if (!repo) {
       // Non-asset paths that reach the worker have no answer of their own, so
       // a browser gets the site's own 404 page rather than a bare string. The
-      // /apt/ branch below deliberately keeps text/plain: apt is a package
-      // manager, and an HTML error page only confuses it.
+      // repository branch below deliberately keeps text/plain: apt and dnf
+      // are package managers, and an HTML error page only confuses them.
       const page = await env.ASSETS.fetch(new URL("/404.html", url));
       if (!page.ok) return new Response("not found\n", { status: 404 });
       return new Response(page.body, {
@@ -194,16 +292,16 @@ export default {
     // page that reads like the repository is broken.
     let key;
     try {
-      key = decodeURIComponent(url.pathname.slice("/apt/".length));
+      key = decodeURIComponent(url.pathname.slice(repo.length + 2));
     } catch {
       return new Response("bad request\n", { status: 400 });
     }
     if (!key) {
-      return new Response("octomon apt repository\n", {
+      return new Response(`octomon ${repo} repository\n`, {
         headers: { "content-type": "text/plain; charset=utf-8" },
       });
     }
-    const object = await env.APT.get(`apt/${key}`);
+    const object = await env.APT.get(`${repo}/${key}`);
     if (!object) {
       return new Response("not found\n", { status: 404 });
     }
@@ -211,9 +309,10 @@ export default {
       "content-type": contentType(key),
       "content-length": String(object.size),
       etag: object.httpEtag,
-      // Indexes change on release; short TTL keeps `apt update` honest while
-      // still absorbing fleets that update in lockstep. Pool files are
-      // versioned by name and could cache longer, but one rule is simpler.
+      // Indexes change on release; short TTL keeps `apt update` and `dnf
+      // makecache` honest while still absorbing fleets that update in
+      // lockstep. Package files are versioned by name and could cache
+      // longer, but one rule is simpler.
       "cache-control": "public, max-age=300",
     };
     if (request.method === "HEAD") {

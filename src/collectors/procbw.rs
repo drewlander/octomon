@@ -7,9 +7,10 @@
 //! the current rate alongside. Exits early (marking unsupported) where the
 //! platform has no unprivileged source.
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::app::{AppState, ContainerInfo, ProcBandwidth, ProcStatus, RemoteBandwidth};
@@ -241,9 +242,13 @@ async fn full_names() -> HashMap<u32, String> {
     tokio::task::spawn_blocking(|| {
         // Names only: the default refresh also reads command lines, environment
         // and disk usage for every process, which is a lot of work every 2s.
-        let mut sys = System::new_with_specifics(
+        // Fallible as of sysinfo 0.40; with no table the rows go unlabelled,
+        // which is what a miss already meant here.
+        let Ok(mut sys) = System::new_with_specifics(
             RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
-        );
+        ) else {
+            return HashMap::new();
+        };
         sys.refresh_processes(ProcessesToUpdate::All, true);
         sys.processes()
             .iter()
@@ -277,33 +282,42 @@ async fn full_names() -> HashMap<u32, String> {
     map
 }
 
-pub async fn run(state: Arc<Mutex<AppState>>, cfg: crate::config::Config) {
+/// Whether this collector has a source to read: `Some(true)` with per-socket
+/// counters, `Some(false)` with only a container source, `None` with
+/// neither. Probes support, records the answer in `proc_status` (unsupported,
+/// or "needs elevated privileges", rather than just "empty") and logs it, so
+/// the supervisor can leave the collector unstarted on a platform that has
+/// neither without that reading as a collector that stopped on its own.
+pub async fn available(state: &Arc<Mutex<AppState>>, cfg: &crate::config::Config) -> Option<bool> {
     // Containers come from their own source and need neither `ss` nor ETW,
     // so a platform without per-socket counters still gets container rows.
-    let mut ct = containers::Source::new(&cfg);
-    // Probe support once; mark unsupported (not just "empty") if unavailable.
     let sockets_ok = platform::proc_net_sample().await.is_some();
-    if !sockets_ok {
-        let needs_privilege = platform::proc_needs_privilege();
-        crate::errlog::log(
-            "talkers",
-            if needs_privilege {
-                "per-process bandwidth needs elevated privileges — the talkers table stays empty"
-            } else {
-                "per-process bandwidth is unavailable on this platform — the talkers table stays empty"
-            },
-        );
-        state.lock().unwrap().proc_status = if needs_privilege {
-            ProcStatus::NeedsPrivilege
-        } else {
-            ProcStatus::Unsupported
-        };
-        if !ct.enabled() {
-            return;
-        }
-    } else {
-        state.lock().unwrap().proc_status = ProcStatus::Supported;
+    if sockets_ok {
+        state.lock().proc_status = ProcStatus::Supported;
+        return Some(true);
     }
+    let needs_privilege = platform::proc_needs_privilege();
+    crate::errlog::log(
+        "talkers",
+        if needs_privilege {
+            "per-process bandwidth needs elevated privileges — the talkers table stays empty"
+        } else {
+            "per-process bandwidth is unavailable on this platform — the talkers table stays empty"
+        },
+    );
+    state.lock().proc_status = if needs_privilege {
+        ProcStatus::NeedsPrivilege
+    } else {
+        ProcStatus::Unsupported
+    };
+    containers::Source::new(cfg).enabled().then_some(false)
+}
+
+pub async fn run(state: Arc<Mutex<AppState>>, cfg: crate::config::Config) {
+    let Some(sockets_ok) = available(&state, &cfg).await else {
+        return;
+    };
+    let mut ct = containers::Source::new(&cfg);
 
     // Counter key -> (bytes_in, bytes_out, retx) from the previous sample. Keyed
     // by the counter, not the process: on Linux each sample is one socket, and
@@ -355,7 +369,7 @@ pub async fn run(state: Arc<Mutex<AppState>>, cfg: crate::config::Config) {
         let secs = now.duration_since(prev_at).as_secs_f64().max(0.001);
 
         // A reset from the UI wipes the session, not just the tables.
-        if state.lock().unwrap().bw_reset {
+        if state.lock().bw_reset {
             procs.clear();
             remotes.clear();
         }
@@ -483,7 +497,7 @@ pub async fn run(state: Arc<Mutex<AppState>>, cfg: crate::config::Config) {
         prev_at = now;
         primed = true;
 
-        let mut st = state.lock().unwrap();
+        let mut st = state.lock();
         st.bw_reset = false;
         // Presence and lifecycle are facts about the machine, recorded
         // whether or not the tables are paused.

@@ -12,8 +12,9 @@
 //! before it stands — one endpoint having a bad day must not read as "your
 //! network is broken" (same philosophy as multi-anchor ping consensus).
 
+use parking_lot::Mutex;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use futures_util::StreamExt;
@@ -208,15 +209,40 @@ pub fn date_skew_ms(date: &str) -> Option<f64> {
     Some((now.timestamp_millis() - server.timestamp_millis()) as f64)
 }
 
+/// The reason a probe that never resolved its hostname reports. The analysis
+/// matches on it: a web check that failed here is DNS's failure, not a
+/// firewall's.
+pub const LOOKUP_FAILED: &str = "name lookup failed";
+
 /// Compress reqwest's error chains into something a status line can carry.
 fn short_reason(e: &reqwest::Error) -> String {
     if e.is_timeout() {
         "timeout".to_string()
     } else if e.is_connect() {
-        "connect failed".to_string()
+        // hyper files a failed name lookup under "connect"; its own layer in
+        // the chain says "dns error". Keeping the two apart matters: a lookup
+        // failure beside dead resolvers is one fault, a refused TCP connect
+        // beside working resolvers is another.
+        if chain_mentions_dns(e) {
+            LOOKUP_FAILED.to_string()
+        } else {
+            "connect failed".to_string()
+        }
     } else {
         "request failed".to_string()
     }
+}
+
+fn chain_mentions_dns(e: &reqwest::Error) -> bool {
+    use std::error::Error as _;
+    let mut src = e.source();
+    while let Some(s) = src {
+        if s.to_string().contains("dns error") {
+            return true;
+        }
+        src = s.source();
+    }
+    false
 }
 
 /// Probe, and on a bad answer let an independent provider arbitrate. The third
@@ -291,7 +317,7 @@ pub async fn run(state: Arc<Mutex<AppState>>, cfg: Config, changed: Arc<Notify>)
         }
 
         let (v6_applicable, proxy_url) = {
-            let s = state.lock().unwrap();
+            let s = state.lock();
             (
                 has_global_v6(&s.netinfo.ipv6),
                 s.proxy.as_ref().and_then(|p| p.https_url()),
@@ -318,7 +344,7 @@ pub async fn run(state: Arc<Mutex<AppState>>, cfg: Config, changed: Arc<Notify>)
             }
         };
 
-        let mut s = state.lock().unwrap();
+        let mut s = state.lock();
         if let Some(skew) = skew4.or(skew6) {
             s.clock.record_http_skew(skew);
         }

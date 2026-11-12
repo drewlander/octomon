@@ -5,7 +5,8 @@
 //! website's /privacy page shows everything its operator can see), and
 //! `edge_check_url = ""` disables it entirely.
 
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -21,16 +22,23 @@ const REFRESH: Duration = Duration::from_secs(15 * 60);
 
 /// `interactive` is false for `--check` / `--doctor`, which have no screen
 /// for the update notice to open on.
+/// Whether this collector has anything to do: an empty `edge_check_url`
+/// (`--no-edge` clears it) turns it off, and the supervisor then never
+/// starts it.
+pub fn enabled(cfg: &Config) -> bool {
+    !cfg.edge_check_url.trim().is_empty()
+}
+
 pub async fn run(
     state: Arc<Mutex<AppState>>,
     cfg: Config,
     changed: Arc<Notify>,
     interactive: bool,
 ) {
-    let url = cfg.edge_check_url.trim().to_string();
-    if url.is_empty() {
+    if !enabled(&cfg) {
         return;
     }
+    let url = cfg.edge_check_url.trim().to_string();
     // One client per family, pinned by local address: on a dual-stack link
     // the v4 and v6 routes can land on different PoPs at different
     // distances, and an unpinned client would report whichever it happened
@@ -65,7 +73,7 @@ pub async fn run(
         // *network change* is different: the old answer describes the old
         // path, so it is cleared below before the re-fetch.
         if let Some((info, latest)) = fetch(&client, &with_reason(&url, why)).await {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock();
             s.edge = Some(info);
             // A newer release exists: the startup check raises the notice,
             // a later one only writes the timeline (see `announce_update`).
@@ -73,22 +81,22 @@ pub async fn run(
                 s.announce_update(latest, interactive && why == "start");
             }
         }
-        let v6_applicable = cfg.probe_ipv6
-            && crate::collectors::http::has_global_v6(&state.lock().unwrap().netinfo.ipv6);
+        let v6_applicable =
+            cfg.probe_ipv6 && crate::collectors::http::has_global_v6(&state.lock().netinfo.ipv6);
         if let Some(c6) = client6.as_ref().filter(|_| v6_applicable) {
             let info6 = fetch(c6, &with_reason(&url, why))
                 .await
                 .map(|(info, _)| info);
             // A failed v6 fetch on a link that claims v6 is itself telling:
             // the row goes empty rather than keeping a stale answer.
-            state.lock().unwrap().edge6 = info6;
+            state.lock().edge6 = info6;
         } else {
-            state.lock().unwrap().edge6 = None;
+            state.lock().edge6 = None;
         }
         tokio::select! {
             _ = changed.notified() => {
                 {
-                    let mut s = state.lock().unwrap();
+                    let mut s = state.lock();
                     s.edge = None;
                     s.edge6 = None;
                 }
@@ -101,11 +109,33 @@ pub async fn run(
     }
 }
 
-/// `url` with the call's reason as a query parameter, whatever the base URL
-/// already carries.
+/// `url` with the call's reason and the platform as query parameters,
+/// whatever the base URL already carries. The platform is one of a fixed
+/// handful of build targets (see [`platform_bucket`]), as coarse as the
+/// version: it names a public build, not a machine.
 fn with_reason(url: &str, why: &str) -> String {
     let sep = if url.contains('?') { '&' } else { '?' };
-    format!("{url}{sep}why={why}")
+    format!("{url}{sep}why={why}&plat={}", platform_bucket())
+}
+
+/// The build this octomon is, as the /edge counter buckets it: OS and
+/// architecture, one of six names, or "other". The set is fixed here and in
+/// the Worker, which drops anything else, so the count can never carry a
+/// finer detail than these.
+pub(crate) fn platform_bucket() -> &'static str {
+    platform_bucket_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn platform_bucket_for(os: &str, arch: &str) -> &'static str {
+    match (os, arch) {
+        ("macos", "aarch64") => "macos-arm64",
+        ("macos", "x86_64") => "macos-x64",
+        ("windows", "x86_64") => "windows-x64",
+        ("windows", "aarch64") => "windows-arm64",
+        ("linux", "x86_64") => "linux-x64",
+        ("linux", "aarch64") => "linux-arm64",
+        _ => "other",
+    }
 }
 
 async fn fetch(client: &reqwest::Client, url: &str) -> Option<(EdgeInfo, String)> {
@@ -165,17 +195,32 @@ mod tests {
     use super::parse;
 
     #[test]
-    fn reasons_ride_the_query_string_either_way() {
-        use super::with_reason;
+    fn reasons_and_the_platform_ride_the_query_string_either_way() {
+        use super::{platform_bucket, with_reason};
+        let plat = platform_bucket();
         assert_eq!(
             with_reason("https://octomon.dev/edge", "start"),
-            "https://octomon.dev/edge?why=start"
+            format!("https://octomon.dev/edge?why=start&plat={plat}")
         );
         // A custom edge_check_url that already carries a query keeps it.
         assert_eq!(
             with_reason("https://example.com/edge?token=x", "refresh"),
-            "https://example.com/edge?token=x&why=refresh"
+            format!("https://example.com/edge?token=x&why=refresh&plat={plat}")
         );
+    }
+
+    /// Six named builds and nothing finer; anything else is "other".
+    #[test]
+    fn the_platform_is_one_of_six_names_or_other() {
+        use super::platform_bucket_for;
+        assert_eq!(platform_bucket_for("macos", "aarch64"), "macos-arm64");
+        assert_eq!(platform_bucket_for("macos", "x86_64"), "macos-x64");
+        assert_eq!(platform_bucket_for("windows", "x86_64"), "windows-x64");
+        assert_eq!(platform_bucket_for("windows", "aarch64"), "windows-arm64");
+        assert_eq!(platform_bucket_for("linux", "x86_64"), "linux-x64");
+        assert_eq!(platform_bucket_for("linux", "aarch64"), "linux-arm64");
+        assert_eq!(platform_bucket_for("freebsd", "x86_64"), "other");
+        assert_eq!(platform_bucket_for("linux", "riscv64"), "other");
     }
 
     #[test]

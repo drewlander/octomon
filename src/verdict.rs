@@ -677,7 +677,7 @@ enum Health {
 /// `normal_loss` is the learned loss for this kind of path on this network,
 /// when there is one — a plane's 30% is its weather, an office's 30% is an
 /// incident, and this is where the two stop being judged by the same number.
-fn probe_health(t: &TargetStat, normal_loss: Option<f64>) -> Health {
+fn probe_health(t: &TargetStat, normal_loss: Option<f64>, normal_ms: Option<f64>) -> Health {
     if t.window.len() < th::MIN_SAMPLES {
         return Health::NoData;
     }
@@ -694,10 +694,39 @@ fn probe_health(t: &TargetStat, normal_loss: Option<f64>) -> Health {
         RttGrade::Bad | RttGrade::Warn => return Health::Warn,
         RttGrade::Good => {}
     }
-    if inflated(t) {
+    if inflated_vs(t, normal_ms) {
         return Health::Warn;
     }
     Health::Good
+}
+
+/// [`inflated`], with the location's learned normal as a second floor. A
+/// session that began while the path was already slow has a session floor
+/// that *is* the slow state, so against it nothing is ever inflated; the
+/// normal is the one thing that still knows ("~0 ms normal here" beside a
+/// 272 ms gateway). The caller passes a normal only from an established
+/// baseline, so first visits are judged on the session alone as before.
+fn inflated_vs(t: &TargetStat, normal_ms: Option<f64>) -> bool {
+    inflated(t)
+        || normal_ms
+            .zip(t.stats(th::RECENT).mean)
+            .is_some_and(|(normal, mean)| crate::baseline::well_above(mean, normal))
+}
+
+/// The web check failed before it could connect: its hostname never
+/// resolved. The check goes through the system resolver like a browser does,
+/// so this is DNS seen from the application side, not a web fault.
+fn web_lookup_failed(s: &AppState) -> bool {
+    matches!(&s.http.v4, crate::app::FamilyProbe::Fail(r) if r == crate::collectors::http::LOOKUP_FAILED)
+}
+
+/// What an inflation summary compares against: the session floor when that
+/// is what showed it, else the learned normal that did.
+fn inflation_reference(t: &TargetStat, normal_ms: Option<f64>) -> String {
+    match normal_ms {
+        Some(normal) if !inflated(t) => format!("~{normal:.0}ms normal here"),
+        _ => format!("{} floor", fmt_ms(t.floor_ms())),
+    }
 }
 
 /// How one round-trip reading compares with what this path normally shows.
@@ -1111,8 +1140,13 @@ pub fn evaluate(s: &AppState) -> Triage {
     // than usual here* is a fault.
     let gw_norm = baseline.and_then(|b| b.gateway_loss_pct);
     let anchor_norm = baseline.and_then(|b| b.anchor_loss_pct);
+    // Learned latency normals are a second floor for the inflation
+    // judgement (see inflated_vs): without them a session started during
+    // the slow spell would never call it slow.
+    let gw_norm_ms = baseline.and_then(|b| b.gateway_ms);
+    let anchor_norm_ms = baseline.and_then(|b| b.anchor_ms);
     let gw_health = gw
-        .map(|g| probe_health(g, gw_norm))
+        .map(|g| probe_health(g, gw_norm, gw_norm_ms))
         .unwrap_or(Health::NoData);
     // Anchors: the built-in resolvers (Cloudflare/Google/Quad9), the jury
     // that decides whether *the internet* is reachable. They are chosen
@@ -1148,23 +1182,23 @@ pub fn evaluate(s: &AppState) -> Triage {
     let with_data: Vec<&TargetStat> = anchors
         .iter()
         .copied()
-        .filter(|t| probe_health(t, anchor_norm) != Health::NoData)
+        .filter(|t| probe_health(t, anchor_norm, anchor_norm_ms) != Health::NoData)
         .collect();
     let bad: Vec<&TargetStat> = with_data
         .iter()
         .copied()
-        .filter(|t| probe_health(t, anchor_norm) == Health::Bad)
+        .filter(|t| probe_health(t, anchor_norm, anchor_norm_ms) == Health::Bad)
         .collect();
     let fine = with_data.len() - bad.len();
     // The user's own targets, with data: never jurors, always destinations.
     let own: Vec<&TargetStat> = own
         .into_iter()
-        .filter(|t| probe_health(t, anchor_norm) != Health::NoData)
+        .filter(|t| probe_health(t, anchor_norm, anchor_norm_ms) != Health::NoData)
         .collect();
     let own_bad: Vec<&TargetStat> = own
         .iter()
         .copied()
-        .filter(|t| probe_health(t, anchor_norm) == Health::Bad)
+        .filter(|t| probe_health(t, anchor_norm, anchor_norm_ms) == Health::Bad)
         .collect();
     let gw_fine = matches!(gw_health, Health::Good | Health::Warn);
     // Every anchor packet transits the gateway, so ≥2 clean anchors with none
@@ -1248,7 +1282,7 @@ pub fn evaluate(s: &AppState) -> Triage {
             .zip(g.stats(th::RECENT).mean)
             .is_some_and(|(normal, cur)| !crate::baseline::well_above(cur, normal));
         let raise = gw_health == Health::Bad
-            || (gw_health != Health::NoData && inflated(g) && !baseline_says_normal);
+            || (gw_health != Health::NoData && inflated_vs(g, gw_norm_ms) && !baseline_says_normal);
         if raise {
             // An ICMP-dropping-but-forwarding gateway flips the claim from an
             // alarm to a note: the clean anchors stop being a contradiction of
@@ -1276,9 +1310,13 @@ pub fn evaluate(s: &AppState) -> Triage {
             // (the radio's airtime, the uplink's queue) — not the gateway box
             // failing, and not the wide internet. Only the gateway inflated is
             // the gateway's own claim.
-            let inflated_anchors = with_data.iter().filter(|t| inflated(t)).count();
-            let uniform =
-                inflated(g) && with_data.len() >= 2 && inflated_anchors * 2 >= with_data.len();
+            let inflated_anchors = with_data
+                .iter()
+                .filter(|t| inflated_vs(t, anchor_norm_ms))
+                .count();
+            let uniform = inflated_vs(g, gw_norm_ms)
+                && with_data.len() >= 2
+                && inflated_anchors * 2 >= with_data.len();
             let summary = if gw_drops_icmp {
                 "gateway drops ICMP (forwarding fine)".to_string()
             } else if loss >= th::LOSS_DOWN_PCT {
@@ -1287,15 +1325,15 @@ pub fn evaluate(s: &AppState) -> Triage {
                 format!("gateway losing packets ({loss:.0}% loss)")
             } else if uniform {
                 format!(
-                    "access link congested — latency inflated on every path ({} vs {} floor)",
+                    "access link congested — latency inflated on every path ({} vs {})",
                     fmt_ms(g.stats(th::RECENT).mean),
-                    fmt_ms(g.floor_ms())
+                    inflation_reference(g, gw_norm_ms)
                 )
             } else {
                 format!(
-                    "gateway latency inflated ({} vs {} floor)",
+                    "gateway latency inflated ({} vs {})",
                     fmt_ms(g.stats(th::RECENT).mean),
-                    fmt_ms(g.floor_ms())
+                    inflation_reference(g, gw_norm_ms)
                 )
             };
             let mut evidence = vec![format!(
@@ -1553,6 +1591,12 @@ pub fn evaluate(s: &AppState) -> Triage {
                 ));
             }
         }
+        if web_lookup_failed(s) {
+            evidence.push(
+                "the web check could not resolve its hostname either — the browser's view of the same fault"
+                    .to_string(),
+            );
+        }
         // A working HTTP probe *proves* names resolve — it fetched a hostname
         // through the system resolver. When octomon's own resolver probes fail
         // anyway (link-local quirks, port-53 filtering on carrier networks),
@@ -1663,6 +1707,15 @@ pub fn evaluate(s: &AppState) -> Triage {
                             .to_string(),
                     );
                 }
+                // When the wait is long enough that the web check itself ran
+                // out of time, "internet OK" is not what the user sees.
+                let stalling = first_in_order && http_failing;
+                if stalling {
+                    evidence.insert(
+                        2,
+                        "the web check failed too: lookups are stalling on it, the internet itself is fine".to_string(),
+                    );
+                }
                 findings.push(Finding {
                     cause: Cause::LocalDns,
                     severity: Severity::Degraded,
@@ -1670,29 +1723,87 @@ pub fn evaluate(s: &AppState) -> Triage {
                     // the LAN's resolver does not. Corroboration: it is the
                     // resolver the OS puts first — the one the network gave.
                     confidence: judge(fine >= 2 || http_ok, first_in_order, dns_symptom),
-                    summary: format!(
-                        "local DNS {} down — internet OK, local names won't resolve",
-                        p.server
-                    ),
+                    summary: if stalling {
+                        format!(
+                            "local DNS {} down and asked first — every lookup waits on its timeout",
+                            p.server
+                        )
+                    } else {
+                        format!(
+                            "local DNS {} down — internet OK, local names won't resolve",
+                            p.server
+                        )
+                    },
                     evidence,
                     subject: p.server.to_string(),
                     symptom: dns_symptom,
                     since: None,
                 });
             } else {
-                findings.push(Finding {
-                    cause: Cause::Dns,
-                    severity: Severity::Info,
-                    confidence: Confidence::Weak,
-                    summary: format!(
-                        "{n_fail} of {} DNS resolvers failing — others fine",
-                        probes.len()
-                    ),
-                    evidence,
-                    subject: String::new(),
-                    symptom: false,
-                    since: None,
-                });
+                // The one the OS asks first matters more than the others:
+                // glibc waits on its timeout before the next is even tried,
+                // so with it dead every lookup is seconds late and the web
+                // check (which resolves a hostname) runs past its deadline.
+                // Found by the rig: wg-quick's policy rule swallows the v4
+                // route to Tailscale's MagicDNS, the v6 one still answers.
+                // The web check failing is what makes this a degradation;
+                // a resolver that falls back fast (macOS asks them all at
+                // once) is the footnote it always was.
+                let first_dead = probes
+                    .iter()
+                    .copied()
+                    .find(|p| failing(p) && s.netinfo.dns.first() == Some(&p.server.to_string()));
+                match first_dead {
+                    Some(p) if http_failing => {
+                        let other = probes
+                            .iter()
+                            .find(|q| !failing(q))
+                            .map(|q| q.server.to_string())
+                            .unwrap_or_default();
+                        let mut evidence = evidence.clone();
+                        evidence.insert(
+                            0,
+                            "first in resolver order: every lookup waits on its timeout before the next resolver is tried"
+                                .to_string(),
+                        );
+                        evidence.insert(
+                            1,
+                            format!(
+                                "the web check failed ({}) while {other} answers — lookups are stalling, not blocked",
+                                match &s.http.v4 {
+                                    crate::app::FamilyProbe::Fail(r) => r.as_str(),
+                                    _ => "",
+                                }
+                            ),
+                        );
+                        findings.push(Finding {
+                            cause: Cause::Dns,
+                            severity: Severity::Degraded,
+                            confidence: judge(fine >= 2, true, dns_symptom),
+                            summary: format!(
+                                "first DNS resolver {} not answering — every lookup waits on its timeout, {other} works",
+                                p.server
+                            ),
+                            evidence,
+                            subject: p.server.to_string(),
+                            symptom: dns_symptom,
+                            since: None,
+                        });
+                    }
+                    _ => findings.push(Finding {
+                        cause: Cause::Dns,
+                        severity: Severity::Info,
+                        confidence: Confidence::Weak,
+                        summary: format!(
+                            "{n_fail} of {} DNS resolvers failing — others fine",
+                            probes.len()
+                        ),
+                        evidence,
+                        subject: String::new(),
+                        symptom: false,
+                        since: None,
+                    }),
+                }
             }
         }
     }
@@ -1939,7 +2050,7 @@ pub fn evaluate(s: &AppState) -> Triage {
 
     // --- devices on the LAN: never an internet question ---
     for t in &lan_targets {
-        if probe_health(t, None) != Health::Bad {
+        if probe_health(t, None, None) != Health::Bad {
             continue;
         }
         let loss = t.recent_loss_pct(th::RECENT);
@@ -2168,11 +2279,44 @@ pub fn evaluate(s: &AppState) -> Triage {
                 FP::Fail(r) => r.clone(),
                 _ => String::new(),
             };
+            let lookup_failed = web_lookup_failed(s);
+            // The web check never got as far as a connection: it could not
+            // resolve its hostname, or it ran out of time, which with a
+            // resolver stalling every lookup is the same thing seen later.
+            // With a DNS finding already standing above, the failure is that
+            // finding's own evidence (it cites it), not a second fault with a
+            // firewall story.
+            let dns_has_the_floor = (lookup_failed || reason == "timeout")
+                && findings.iter().any(|f| {
+                    matches!(f.cause, Cause::Dns | Cause::LocalDns) && f.severity != Severity::Info
+                });
             // A configured proxy that works turns this from a fault into how
             // this network is meant to be used.
             let proxied_ok = matches!(http.via_proxy, FP::Ok(_));
             let proxy_desc = s.proxy.as_ref().map(|p| p.describe()).unwrap_or_default();
-            if proxied_ok {
+            if dns_has_the_floor {
+                // Nothing to add.
+            } else if lookup_failed && probes.iter().any(|p| !failing(p)) {
+                // The resolvers answer octomon's direct queries, yet the
+                // system resolver path the web check (and every browser) goes
+                // through fails: a stub, nsswitch or search-domain problem on
+                // this machine rather than the network's DNS. Without DNS
+                // probe data there is no contrast to draw, and the generic
+                // finding below carries the lookup reason as it is.
+                findings.push(Finding {
+                    cause: Cause::LocalDns,
+                    severity: Severity::Degraded,
+                    confidence: judge(true, false, false),
+                    summary: "names fail to resolve for applications while the resolvers answer direct queries".to_string(),
+                    evidence: vec![
+                        format!("HTTP probe: {reason} on two independent endpoints; octomon's own queries to the resolvers succeed"),
+                        "the system resolver path (a local stub, nsswitch, search domains) is the difference".to_string(),
+                    ],
+                    subject: String::new(),
+                    symptom: false,
+                    since: None,
+                });
+            } else if proxied_ok {
                 findings.push(Finding {
                     cause: Cause::HttpBlocked,
                     severity: Severity::Info,
@@ -2239,7 +2383,10 @@ pub fn evaluate(s: &AppState) -> Triage {
         for t in s.targets.iter().filter(|t| !t.discovered) {
             if t.web.status == crate::app::WebStatus::Web
                 && t.web.fails >= 2
-                && matches!(probe_health(t, anchor_norm), Health::Good | Health::Warn)
+                && matches!(
+                    probe_health(t, anchor_norm, anchor_norm_ms),
+                    Health::Good | Health::Warn
+                )
             {
                 findings.push(Finding {
                     cause: Cause::WebTarget,
@@ -2587,12 +2734,33 @@ pub fn evaluate(s: &AppState) -> Triage {
     let mut usable = false;
     if let Some(ms) = web_ok_ms
         && !no_link
-        && !normally_clean
         && findings.iter().any(&demotable)
     {
         if blackholed {
+            // Every ping unanswered while the web check and the TCP series
+            // succeed is never an outage, at home as much as on a plane: the
+            // ping-driven claims are void here too. The difference a clean
+            // normal makes is that the silence is *new*, so it gets a note
+            // instead of nothing — a firewall or a router setting changed,
+            // and the user may want to know why their pings stopped.
             findings.retain(|f| !demotable(f));
-        } else {
+            if normally_clean {
+                findings.push(Finding {
+                    cause: Cause::GatewayLan,
+                    severity: Severity::Info,
+                    confidence: judge(true, true, false),
+                    summary: "pings stopped being answered on this network — web and TCP traffic unaffected".to_string(),
+                    evidence: vec![
+                        format!("web check ok ({ms:.0}ms) — names resolve and pages load over this link"),
+                        "every ICMP probe unanswered, the gateway's included; tcp :443 to the anchors fine".to_string(),
+                        "this network normally answers pings — something on the path or this machine now drops them".to_string(),
+                    ],
+                    subject: String::new(),
+                    symptom: false,
+                    since: None,
+                });
+            }
+        } else if !normally_clean {
             usable = true;
             let mut evidence = vec![format!(
                 "web check ok ({ms:.0}ms) — names resolve and pages load over this link"
@@ -2949,6 +3117,11 @@ fn build_rungs(
     https_down: bool,
 ) -> Vec<Rung> {
     let mut rungs = Vec::with_capacity(7);
+    let anchor_norm_ms = s
+        .baseline
+        .as_ref()
+        .filter(|b| b.established())
+        .and_then(|b| b.anchor_ms);
     let health_status = |h: Health| match h {
         Health::NoData => RungStatus::Unknown,
         Health::Good => RungStatus::Ok,
@@ -3340,7 +3513,12 @@ fn build_rungs(
         // Latency counts too: a green check beside "worst p95 504ms" was the
         // rung grading only loss while the table graded the same anchors red.
         let inflated_majority = with_data.len() >= 2
-            && with_data.iter().filter(|t| inflated(t)).count() * 2 >= with_data.len();
+            && with_data
+                .iter()
+                .filter(|t| inflated_vs(t, anchor_norm_ms))
+                .count()
+                * 2
+                >= with_data.len();
         let status = if bad.len() >= 2 {
             if usable {
                 RungStatus::Warn
@@ -3584,7 +3762,7 @@ fn build_rungs(
             let warn: Vec<&str> = with_data
                 .iter()
                 .chain(own.iter())
-                .filter(|t| probe_health(t, anchor_norm) != Health::Good)
+                .filter(|t| probe_health(t, anchor_norm, anchor_norm_ms) != Health::Good)
                 .map(|t| t.label.as_str())
                 .collect();
             if warn.is_empty() {
@@ -4402,7 +4580,7 @@ pub fn session_state(v: &Verdict) -> crate::session::SessionState {
     }
 }
 
-pub async fn run(state: std::sync::Arc<std::sync::Mutex<AppState>>, cfg: crate::config::Config) {
+pub async fn run(state: std::sync::Arc<parking_lot::Mutex<AppState>>, cfg: crate::config::Config) {
     let mut tick = tokio::time::interval(cfg.sample_interval());
     let sinks = cfg.alert.sinks();
     // Consecutive fully-healthy ticks; a fold happens each time this hits 60.
@@ -4418,7 +4596,7 @@ pub async fn run(state: std::sync::Arc<std::sync::Mutex<AppState>>, cfg: crate::
         let mut episodes: Vec<crate::history::Episode> = Vec::new();
         let net_changes: Vec<crate::app::NetChange>;
         let io = {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock();
             let triage = evaluate(&s);
             let insufficient = insufficient_reason(&s);
             let network = s.baseline_key.clone();
@@ -4537,7 +4715,7 @@ pub async fn run(state: std::sync::Arc<std::sync::Mutex<AppState>>, cfg: crate::
                         // Stamp the visit and write it back, so recency
                         // ordering survives visits that never reach a
                         // healthy minute (which is when folds would save).
-                        if let Some(b) = b.as_mut() {
+                        if let Ok(Some(b)) = b.as_mut() {
                             b.last_seen = Some(chrono::Utc::now().timestamp());
                             crate::baseline::save_one(&key, b);
                         }
@@ -4545,11 +4723,35 @@ pub async fn run(state: std::sync::Arc<std::sync::Mutex<AppState>>, cfg: crate::
                     }
                 })
                 .await
-                .ok()
-                .flatten();
-                let mut s = state.lock().unwrap();
+                .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+                let mut s = state.lock();
                 // The network may have moved again while we read the file.
                 if crate::baseline::fingerprint(&s.netinfo).map(|f| f.0) == Some(key.clone()) {
+                    // A read that failed is not a new network: learn this
+                    // visit in memory, but never save it over what the file
+                    // may still hold for it.
+                    s.baseline_unsaved = loaded.is_err();
+                    let loaded = match loaded {
+                        Ok(b) => b,
+                        Err(e) => {
+                            // Name the file, and the likeliest cause: a file an
+                            // earlier `sudo octomon` left root-owned. The
+                            // startup notice names the fix when that is so
+                            // (store::root_owned_leftovers); this line points
+                            // at it.
+                            let file = crate::baseline::file_name();
+                            let message = format!(
+                                "couldn't read {file} ({e}) — learning this network for this session only; if an earlier run was under sudo, the startup notice has the command that gives the file back"
+                            );
+                            crate::errlog::log("baseline", &message);
+                            s.notice_event(
+                                Severity::Degraded,
+                                crate::app::EventCategory::Logging,
+                                message,
+                            );
+                            None
+                        }
+                    };
                     // A stored baseline means this is a location we have been
                     // to before: say so, by name, in the histories — the
                     // network-changed entry preceding this fired before the
@@ -4595,9 +4797,12 @@ pub async fn run(state: std::sync::Arc<std::sync::Mutex<AppState>>, cfg: crate::
                 }
             }
             BaselineIo::Save { key, baseline } => {
-                let _ =
-                    tokio::task::spawn_blocking(move || crate::baseline::save_one(&key, &baseline))
-                        .await;
+                // Only the one process holding the learner lock writes what
+                // it learns; the others watch (see `baseline::save_learned`).
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::baseline::save_learned(&key, &baseline)
+                })
+                .await;
             }
         }
     }
@@ -4740,9 +4945,15 @@ fn baseline_step(
     // Own load inflating the gateway/anchors skews the same latency fields,
     // finding or not. Judged on the paths whose numbers fold — not LAN
     // devices or mid-path hops.
+    let anchor_norm_ms = s
+        .baseline
+        .as_ref()
+        .filter(|b| b.established())
+        .and_then(|b| b.anchor_ms);
     let load_biased = !matches!(own_load(s), OwnLoad::Quiet)
         && s.targets.iter().any(|t| {
-            (t.hop_ttl() == Some(1) || (!t.discovered && !s.is_lan_addr(t.addr))) && inflated(t)
+            (t.hop_ttl() == Some(1) || (!t.discovered && !s.is_lan_addr(t.addr)))
+                && inflated_vs(t, anchor_norm_ms)
         });
     latency_suspect |= load_biased;
 
@@ -4772,7 +4983,7 @@ fn baseline_step(
         }
     }
 
-    match (changed, s.baseline.clone()) {
+    match (changed && !s.baseline_unsaved, s.baseline.clone()) {
         (true, Some(baseline)) => BaselineIo::Save {
             key,
             baseline: Box::new(baseline),
@@ -6329,6 +6540,145 @@ mod tests {
         assert!(!causes(&evaluate(&s)).contains(&Cause::HttpBlocked));
     }
 
+    /// Found by the rig's DNS fault: with every resolver dead the web check
+    /// fails too, because it never resolves its hostname, and that failure
+    /// was read as a second fault ("proxy or firewall"). A lookup failure
+    /// beside dead resolvers is the DNS finding's own evidence. Beside
+    /// resolvers that answer octomon directly it is a fault on this machine's
+    /// resolver path, still not a firewall's.
+    #[test]
+    fn a_web_check_that_never_resolved_is_not_a_blocked_web() {
+        use crate::app::FamilyProbe;
+        let probe = |ok: bool| {
+            let mut p = crate::app::DnsProbe::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+            for _ in 0..10 {
+                p.record(if ok { Some(9.0) } else { None });
+            }
+            if !ok {
+                p.status = "timeout".into();
+            }
+            p
+        };
+        let mut s = healthy_state();
+        s.dns = vec![probe(false)];
+        s.http.v4 = FamilyProbe::Fail(crate::collectors::http::LOOKUP_FAILED.into());
+        s.http.v6 = FamilyProbe::NotApplicable;
+        let t = evaluate(&s);
+        let c = causes(&t);
+        assert_eq!(c, vec![Cause::Dns], "{c:?}");
+        let dns = &t.findings[0];
+        assert_eq!(dns.severity, Severity::Down);
+        assert!(
+            dns.evidence
+                .iter()
+                .any(|e| e.contains("web check could not resolve")),
+            "{:?}",
+            dns.evidence
+        );
+
+        // Resolvers answer octomon, the web check still cannot resolve: the
+        // machine's own resolver path, named as such.
+        s.dns = vec![probe(true)];
+        let t = evaluate(&s);
+        let c = causes(&t);
+        assert!(!c.contains(&Cause::HttpBlocked), "{c:?}");
+        let f = t
+            .findings
+            .iter()
+            .find(|f| f.cause == Cause::LocalDns)
+            .unwrap();
+        assert_eq!(f.severity, Severity::Degraded);
+        assert!(f.summary.contains("resolvers answer"), "{}", f.summary);
+
+        // A refused connection with names resolving is still the firewall.
+        s.http.v4 = FamilyProbe::Fail("connect failed".into());
+        assert!(causes(&evaluate(&s)).contains(&Cause::HttpBlocked));
+    }
+
+    /// From the rig, Tailscale's MagicDNS beside a wg-quick tunnel: the
+    /// first resolver in the OS order is dead (its route swallowed by the
+    /// tunnel), the second answers, and the web check times out because
+    /// every lookup waits on the first one's timeout. That is a DNS
+    /// degradation with the web timeout as its evidence, not a firewall. The
+    /// same dead resolver with the web check fine stays the footnote.
+    #[test]
+    fn a_dead_first_resolver_that_stalls_the_web_check_is_dns_not_a_firewall() {
+        use crate::app::FamilyProbe;
+        let probe = |a: IpAddr, ok: bool| {
+            let mut p = crate::app::DnsProbe::new(a);
+            for _ in 0..10 {
+                p.record(if ok { Some(10.0) } else { None });
+            }
+            if !ok {
+                p.status = "timeout".into();
+            }
+            p
+        };
+        // MagicDNS is CGNAT space, which counts as local: the local-resolver
+        // branch, worded for the stall rather than "internet OK".
+        let magic_v4: IpAddr = "100.100.100.100".parse().unwrap();
+        let magic_v6: IpAddr = "fd7a:115c:a1e0::53".parse().unwrap();
+        let mut s = healthy_state();
+        s.netinfo.dns = vec![magic_v4.to_string(), magic_v6.to_string()];
+        s.dns = vec![probe(magic_v4, false), probe(magic_v6, true)];
+        s.http.v4 = FamilyProbe::Fail("timeout".into());
+        s.http.v6 = FamilyProbe::NotApplicable;
+        let t = evaluate(&s);
+        let c = causes(&t);
+        assert!(!c.contains(&Cause::HttpBlocked), "{c:?}");
+        let f = t
+            .findings
+            .iter()
+            .find(|f| f.cause == Cause::LocalDns)
+            .unwrap();
+        assert_eq!(f.severity, Severity::Degraded);
+        assert!(f.summary.contains("asked first"), "{}", f.summary);
+        assert!(
+            f.evidence.iter().any(|e| e.contains("stalling")),
+            "{:?}",
+            f.evidence
+        );
+
+        // A public resolver first in order and dead, another answering:
+        // the same stall, as a DNS finding.
+        let quad9: IpAddr = "9.9.9.9".parse().unwrap();
+        let cf: IpAddr = "1.1.1.1".parse().unwrap();
+        s.netinfo.dns = vec![quad9.to_string(), cf.to_string()];
+        s.dns = vec![probe(quad9, false), probe(cf, true)];
+        let t = evaluate(&s);
+        let c = causes(&t);
+        assert!(!c.contains(&Cause::HttpBlocked), "{c:?}");
+        let f = t.findings.iter().find(|f| f.cause == Cause::Dns).unwrap();
+        assert_eq!(f.severity, Severity::Degraded);
+        assert!(
+            f.summary.starts_with("first DNS resolver 9.9.9.9"),
+            "{}",
+            f.summary
+        );
+        assert!(
+            f.evidence
+                .iter()
+                .any(|e| e.contains("waits on its timeout")),
+            "{:?}",
+            f.evidence
+        );
+
+        // Web check fine: applications fall back fast enough, a footnote.
+        s.http.v4 = FamilyProbe::Ok(40.0);
+        let t = evaluate(&s);
+        let f = t.findings.iter().find(|f| f.cause == Cause::Dns).unwrap();
+        assert_eq!(f.severity, Severity::Info);
+
+        // The dead resolver second in order: the OS never waits on it.
+        s.netinfo.dns = vec![cf.to_string(), quad9.to_string()];
+        s.http.v4 = FamilyProbe::Fail("timeout".into());
+        let t = evaluate(&s);
+        let f = t.findings.iter().find(|f| f.cause == Cause::Dns).unwrap();
+        assert_eq!(f.severity, Severity::Info);
+        // ... and the timeout is then unexplained by DNS, so the web story stands.
+        assert!(causes(&t).contains(&Cause::HttpBlocked));
+    }
+
     #[test]
     fn a_working_http_probe_unblinds_a_no_icmp_verdict() {
         use crate::app::FamilyProbe;
@@ -6386,6 +6736,38 @@ mod tests {
             .find(|f| f.cause == Cause::GatewayLan)
             .unwrap();
         assert!(!f.evidence.iter().any(|e| e.contains("normal at")));
+    }
+
+    /// A network whose stored baseline couldn't be read is learned in
+    /// memory, but a fold never asks for a save: the file may still hold what
+    /// it had learned before, and a one-network save would write over it.
+    #[test]
+    fn an_unreadable_store_is_learned_but_never_saved() {
+        let mut s = healthy_state();
+        if let Some(earlier) = Instant::now().checked_sub(Duration::from_secs(300)) {
+            s.started = earlier;
+        }
+        let (key, label) = crate::baseline::fingerprint(&s.netinfo).expect("fingerprintable");
+        s.baseline_key = Some(key);
+        s.baseline = Some(crate::baseline::Baseline {
+            label,
+            ..Default::default()
+        });
+        s.verdict.current = Verdict::Healthy;
+        s.baseline_unsaved = true;
+
+        let mut healthy_run = 59;
+        let mut run_suspect = false;
+        let mut last_speed = Some(0);
+        let io = baseline_step(&mut s, &mut healthy_run, &mut run_suspect, &mut last_speed);
+        assert!(matches!(io, BaselineIo::None), "no save while unsaved");
+        assert_eq!(s.baseline.as_ref().unwrap().samples, 1, "still learned");
+
+        // Once the store could be read again, the next fold saves as usual.
+        s.baseline_unsaved = false;
+        healthy_run = 59;
+        let io = baseline_step(&mut s, &mut healthy_run, &mut run_suspect, &mut last_speed);
+        assert!(matches!(io, BaselineIo::Save { .. }));
     }
 
     /// The anti-poisoning rule: an active finding — even a caveat — means the
@@ -6859,6 +7241,106 @@ mod tests {
             }
         }
         s
+    }
+
+    #[test]
+    fn an_icmp_blackhole_at_a_normally_clean_location_is_a_note_not_an_outage() {
+        // Found by the VPN rig's fault client: with a learned normal saying
+        // pings are always answered here, the same blackhole (every ping
+        // lost, web and tcp :443 fine) came out as "gateway unresponsive",
+        // Down, exit 1 — while the ladder itself said ICMP was blocked and
+        // web traffic crossed the gateway. Nothing that lets the web through
+        // is an outage; what the clean normal adds is that the silence is
+        // new, so it is worth one note.
+        let mut s = healthy_state();
+        for t in &mut s.targets {
+            for _ in 0..th::RECENT {
+                t.record_loss();
+            }
+        }
+        s.http.v4 = crate::app::FamilyProbe::Ok(2.0);
+        s.baseline = Some(crate::baseline::Baseline {
+            samples: crate::baseline::MIN_SAMPLES,
+            anchor_loss_pct: Some(0.0),
+            gateway_loss_pct: Some(0.0),
+            ..Default::default()
+        });
+        assert!(icmp_blackholed(&s));
+        let t = evaluate(&s);
+        assert!(
+            t.findings.iter().all(|f| f.severity == Severity::Info),
+            "got: {:?}",
+            t.findings
+                .iter()
+                .map(|f| (f.cause, f.severity, f.summary.clone()))
+                .collect::<Vec<_>>()
+        );
+        let note = t
+            .findings
+            .iter()
+            .find(|f| f.cause == Cause::GatewayLan)
+            .expect("a note that pings stopped being answered");
+        assert!(note.summary.contains("pings stopped"), "{}", note.summary);
+        assert_eq!(exit_code(&t, false), 0);
+    }
+
+    #[test]
+    fn latency_far_above_the_learned_normal_is_inflated_even_when_the_session_floor_is_not() {
+        // Found by the VPN rig's fault client: +250 ms on every path, in a
+        // session that *started* that way. The session floor is the slow
+        // state, so nothing was ever "inflated" against it, and a gateway at
+        // 272 ms sat green beside "~0 ms normal here". The learned normal
+        // is the second floor; against it this is the access link, and the
+        // summary says what it compared with.
+        let slow = |label: &str, addr: [u8; 4]| {
+            let mut t = TargetStat::new(label.into(), IpAddr::V4(Ipv4Addr::from(addr)));
+            for _ in 0..30 {
+                t.record_reply(270.0);
+            }
+            t
+        };
+        let mut s = AppState::new(vec![
+            slow("Cloudflare", [1, 1, 1, 1]),
+            slow("Google", [8, 8, 8, 8]),
+            slow("Quad9", [9, 9, 9, 9]),
+        ]);
+        let mut gw = slow("gateway", [192, 168, 1, 1]);
+        gw.discovered = true;
+        s.targets.push(gw);
+        s.netinfo.gateway_ip = "192.168.1.1".into();
+        s.vitals.cores = vec![10.0; 8];
+        s.vitals.cpu_pct = 12.0;
+
+        // First visit: 270 ms everywhere could be a satellite link. Nothing
+        // to compare with, nothing claimed.
+        let t = evaluate(&s);
+        assert!(
+            !causes(&t).contains(&Cause::GatewayLan),
+            "got: {:?}",
+            causes(&t)
+        );
+
+        // The location's normal: a wired LAN at a fraction of a millisecond,
+        // the internet at 17 ms.
+        s.baseline = Some(crate::baseline::Baseline {
+            samples: crate::baseline::MIN_SAMPLES,
+            gateway_ms: Some(0.03),
+            anchor_ms: Some(17.0),
+            anchor_loss_pct: Some(0.0),
+            gateway_loss_pct: Some(0.0),
+            ..Default::default()
+        });
+        let t = evaluate(&s);
+        let f = t
+            .findings
+            .iter()
+            .find(|f| f.cause == Cause::GatewayLan)
+            .unwrap_or_else(|| panic!("expected an access-link finding, got {:?}", causes(&t)));
+        assert_eq!(f.severity, Severity::Degraded);
+        assert!(f.summary.contains("access link congested"), "{}", f.summary);
+        assert!(f.summary.contains("normal here"), "{}", f.summary);
+        let gw_rung = t.rungs.iter().find(|r| r.area == Area::Gateway).unwrap();
+        assert_eq!(gw_rung.status, RungStatus::Warn, "{}", gw_rung.detail);
     }
 
     #[test]

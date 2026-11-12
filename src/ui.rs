@@ -1081,19 +1081,25 @@ fn locations_overlay(f: &mut Frame, s: &AppState, area: Rect) {
                         "  ● current",
                         Style::new().fg(theme::accent()).bold(),
                     ));
-                } else if let Some(local) = b
-                    .last_seen
-                    .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
-                    .map(|t| t.with_timezone(&chrono::Local))
-                {
+                } else if let Some(ts) = b.last_seen {
                     // The slot "● current" fills on the active network: for
-                    // every other entry, when this machine last sat on it.
+                    // every other entry, how long since this machine last
+                    // sat on it, and a stale mark once that is long enough
+                    // that the entry is probably a one-off or a re-keyed
+                    // network nobody will match again — a candidate for [d].
                     // (A baseline file from before the field existed simply
                     // has no date, and gets no slot.)
+                    let now = chrono::Utc::now().timestamp();
                     name_row.push(Span::styled(
-                        format!("  · seen {}", local.format("%Y-%m-%d")),
+                        format!("  · {}", crate::baseline::seen_ago(ts, now)),
                         Style::new().fg(theme::dim()),
                     ));
+                    if crate::baseline::is_stale(ts, now) {
+                        name_row.push(Span::styled(
+                            "  · stale",
+                            Style::new().fg(theme::warn()).bold(),
+                        ));
+                    }
                 }
                 // Nothing folded in yet — freshly seen, or just deleted and
                 // re-added blank. Said loudly: the dashes below look broken
@@ -1567,6 +1573,52 @@ fn events_overlay(f: &mut Frame, s: &AppState, area: Rect) {
 /// by any key; the same detail stays available in `[?]` help afterwards.
 fn startup_notice(f: &mut Frame, s: &AppState, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
+
+    if let Some(report) = &s.crash_report {
+        lines.push(Line::from(Span::styled(
+            " ⚠ octomon crashed internally in its last session",
+            Style::new().fg(theme::warn()).bold(),
+        )));
+        let log = crate::errlog::path()
+            .map_or_else(|| "errors.log".to_string(), |p| p.display().to_string());
+        for part in [
+            format!(" {}", report.summary()),
+            " These are bugs in octomon, not problems with your network.".to_string(),
+            " Please open an issue at https://github.com/securitypedant/octomon/issues".to_string(),
+            format!(" and attach {log}"),
+            " The log can name hosts and addresses on your network; look it over first."
+                .to_string(),
+            " This notice is shown once for these errors.".to_string(),
+        ] {
+            lines.push(Line::from(Span::styled(
+                part,
+                Style::new().fg(theme::text()),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if let Some(left) = &s.root_owned {
+        lines.push(Line::from(Span::styled(
+            " ⚠ Some of octomon's files belong to another user",
+            Style::new().fg(theme::warn()).bold(),
+        )));
+        for part in [
+            format!(" {}.", left.summary()),
+            " This run cannot read or update them, so what it learns here is not kept.".to_string(),
+            " To get them back, run:".to_string(),
+        ] {
+            lines.push(Line::from(Span::styled(
+                part,
+                Style::new().fg(theme::text()),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("   {}", left.fix()),
+            Style::new().fg(theme::accent()),
+        )));
+        lines.push(Line::from(""));
+    }
 
     if let Some(err) = &s.icmp_error {
         lines.push(Line::from(Span::styled(
@@ -2680,6 +2732,23 @@ fn triage_overlay(f: &mut Frame, s: &AppState, area: Rect) {
     f.render_widget(Paragraph::new(shown), content);
 }
 
+/// " · stopped: netinfo" when a collector feeding this panel crashed its way
+/// to a stop (see the supervisor in `main`), so a panel that has frozen says
+/// why rather than quietly showing its last reading.
+fn stopped_mark(s: &AppState, feeders: &[&str]) -> String {
+    let stopped: Vec<&str> = s
+        .stopped_collectors
+        .iter()
+        .copied()
+        .filter(|c| feeders.contains(c))
+        .collect();
+    if stopped.is_empty() {
+        String::new()
+    } else {
+        format!(" · stopped: {}", stopped.join(", "))
+    }
+}
+
 fn block(title: &str, focused: bool) -> Block<'static> {
     let border = if focused {
         theme::accent()
@@ -3207,6 +3276,18 @@ fn quality_panel(f: &mut Frame, s: &AppState, area: Rect) {
         title.push_str(" · no ICMP here — web ok");
     }
     title.push(')');
+    title.push_str(&stopped_mark(
+        s,
+        &[
+            "analysis",
+            "tcp",
+            "http",
+            "dns",
+            "egress",
+            "resolve",
+            "discovery watch",
+        ],
+    ));
     f.render_widget(block(&title, s.focus == Panel::Quality), area);
     // The scroll cue runs beside the rows, under the header.
     let body = Rect {
@@ -4154,6 +4235,7 @@ fn bandwidth_panel(f: &mut Frame, s: &AppState, area: Rect) {
     if !s.bw_filter.trim().is_empty() {
         title.push_str(&format!(" · ⌕ {}", s.bw_filter.trim()));
     }
+    title.push_str(&stopped_mark(s, &["throughput", "procbw", "speedtest"]));
     let b = block(&title, s.focus == Panel::Bandwidth);
     let inner = b.inner(area);
     f.render_widget(b, area);
@@ -5376,6 +5458,19 @@ fn net_history_pane(f: &mut Frame, s: &AppState, area: Rect, focused: bool) {
     }
 }
 
+/// The AS organisation the edge saw this connection arrive from, when the
+/// tunnel carrying the traffic is unnamed: the only thing known about where
+/// an unidentified VPN leads.
+fn exit_operator(s: &AppState) -> Option<&str> {
+    if s.netinfo.tunnel.as_deref() != Some("") {
+        return None;
+    }
+    s.edge
+        .as_ref()
+        .map(|e| e.isp.trim())
+        .filter(|isp| !isp.is_empty())
+}
+
 fn netinfo_details(f: &mut Frame, s: &AppState, area: Rect, focused: bool) {
     let n = &s.netinfo;
     // The location name rides in the title, like the Bandwidth panel's iface:
@@ -5393,6 +5488,13 @@ fn netinfo_details(f: &mut Frame, s: &AppState, area: Rect, focused: bool) {
         ),
         None => "Network".to_string(),
     };
+    let title = title
+        + &stopped_mark(
+            s,
+            &[
+                "netinfo", "wifi", "signal", "edge", "clock", "pmtu", "proxy", "web",
+            ],
+        );
     let b = block(&title, focused);
     let inner = b.inner(area);
     f.render_widget(b, area);
@@ -5512,6 +5614,17 @@ fn netinfo_details(f: &mut Frame, s: &AppState, area: Rect, focused: bool) {
         if !n.tunnel_iface.is_empty() {
             row.push(Span::styled(
                 format!("  ({})", n.tunnel_iface),
+                Style::new().fg(theme::text()),
+            ));
+        }
+        // A tunnel nothing could name still has one tell: whose network the
+        // traffic comes out of. The edge sees the exit's AS organisation,
+        // which for a VPN is its operator or its host ("Datacamp Limited"),
+        // so it is offered as a clue beside the unnamed tunnel — never as
+        // the vendor, and never in the location's identity.
+        if let Some(exit) = exit_operator(s) {
+            row.push(Span::styled(
+                format!("  · exit via {exit}"),
                 Style::new().fg(theme::text()),
             ));
         }
@@ -6280,7 +6393,8 @@ fn signal_graph(f: &mut Frame, s: &AppState, area: Rect) {
 
 fn vitals_panel(f: &mut Frame, s: &AppState, area: Rect) {
     let v = &s.vitals;
-    let b = block("Machine", s.focus == Panel::Vitals);
+    let title = format!("Machine{}", stopped_mark(s, &["vitals"]));
+    let b = block(&title, s.focus == Panel::Vitals);
     let inner = b.inner(area);
     f.render_widget(b, area);
 
@@ -6370,14 +6484,11 @@ fn vitals_panel(f: &mut Frame, s: &AppState, area: Rect) {
 
     // Load average, plus swap — swap activity is what actually correlates with
     // "everything feels slow".
-    let (l1, l5, l15) = v.load;
     let cores = v.core_count().max(1) as f64;
-    // Windows has no load-average concept and sysinfo reports zeros for it,
-    // which would render as a measured, permanently idle machine rather than as
-    // a figure the platform does not have. Swap still means something there.
-    let mut load_spans = if cfg!(windows) {
-        Vec::new()
-    } else {
+    // Windows has no load-average concept, so there is no figure to show
+    // rather than a measured, permanently idle machine. Swap still means
+    // something there.
+    let mut load_spans = if let Some((l1, l5, l15)) = v.load {
         vec![
             Span::styled("load ", Style::new().fg(theme::dim())),
             Span::styled(
@@ -6392,6 +6503,8 @@ fn vitals_panel(f: &mut Frame, s: &AppState, area: Rect) {
                 }),
             ),
         ]
+    } else {
+        Vec::new()
     };
     if v.swap_used > 0 {
         // Only separated from the load figures when there are any.
@@ -7512,19 +7625,104 @@ mod tests {
         // A non-current entry shows when it was last seen, in the slot
         // "● current" occupies on the active one — which never shows a date,
         // however fresh its own timestamp is.
-        let ts = 1_756_000_000; // 2025-08-24 UTC
+        let now = chrono::Utc::now().timestamp();
         for (_, b) in s.locations.as_mut().unwrap() {
-            b.last_seen = Some(ts);
+            b.last_seen = Some(now - 3 * 86_400);
         }
-        let expect = chrono::DateTime::from_timestamp(ts, 0)
-            .unwrap()
-            .with_timezone(&chrono::Local)
-            .format("· seen %Y-%m-%d")
-            .to_string();
         let out = draw(&s, 120, 30);
-        assert!(out.contains(&expect), "{out}");
+        assert!(out.contains("· seen 3 days ago"), "{out}");
         assert_eq!(out.matches("· seen").count(), 1, "{out}");
+        assert!(!out.contains("stale"), "{out}");
         assert!(out.contains("● current"), "{out}");
+
+        // Long unvisited: said as such, and marked stale as a candidate for
+        // deletion — a re-keyed network is never matched again.
+        for (_, b) in s.locations.as_mut().unwrap() {
+            b.last_seen = Some(now - 200 * 86_400);
+        }
+        let out = draw(&s, 120, 30);
+        assert!(out.contains("· not seen for 6 months"), "{out}");
+        assert_eq!(
+            out.matches("· stale").count(),
+            1,
+            "never on the current entry: {out}"
+        );
+    }
+
+    /// The startup notice asks for last session's crash log in the approved
+    /// words, with the counts, the times and the file, and says the log may
+    /// name the user's own hosts.
+    #[test]
+    fn startup_notice_asks_for_last_sessions_crash_log() {
+        let mut s = AppState::new(vec![]);
+        s.overlay = Overlay::Startup;
+        s.crash_report = Some(crate::errlog::CrashReport {
+            crashes: 2,
+            panics: 1,
+            first: "08:20".into(),
+            last: "09:05".into(),
+            banner: "=== octomon ===".into(),
+        });
+        let out = draw(&s, 100, 30);
+        for line in [
+            "⚠ octomon crashed internally in its last session",
+            "2 collector crashes and 1 panic were logged between 08:20 and 09:05.",
+            "These are bugs in octomon, not problems with your network.",
+            "Please open an issue at https://github.com/securitypedant/octomon/issues",
+            "and attach ",
+            "errors.log",
+            "The log can name hosts and addresses on your network; look it over first.",
+            "This notice is shown once for these errors.",
+        ] {
+            assert!(out.contains(line), "missing {line:?} in:\n{out}");
+        }
+    }
+
+    /// Files an older sudo run left root-owned: the startup notice says what
+    /// was found, that this run cannot keep what it learns, and the command.
+    #[test]
+    fn startup_notice_gives_the_chown_for_root_owned_leftovers() {
+        let mut s = AppState::new(vec![]);
+        s.overlay = Overlay::Startup;
+        s.root_owned = Some(crate::store::RootOwned {
+            dirs: vec![(
+                std::path::PathBuf::from("/Users/alice/.local/share/octomon"),
+                3,
+            )],
+        });
+        let out = draw(&s, 110, 30);
+        for line in [
+            "⚠ Some of octomon's files belong to another user",
+            // The summary wraps inside the dialog; both halves must be there.
+            "3 files in /Users/alice/.local/share/octomon belong to another user",
+            "by an earlier sudo octomon.",
+            "This run cannot read or update them, so what it learns here is not kept.",
+            "To get them back, run:",
+            "sudo chown -R \"$USER\" \"/Users/alice/.local/share/octomon\"",
+        ] {
+            assert!(out.contains(line), "missing {line:?} in:\n{out}");
+        }
+    }
+
+    /// The relative wording and the stale mark, at their boundaries.
+    #[test]
+    fn last_seen_reads_as_time_ago_and_goes_stale_at_ninety_days() {
+        use crate::baseline::{STALE_AFTER_DAYS, is_stale, seen_ago};
+        let day = 86_400;
+        let now = 1_800_000_000;
+        assert_eq!(seen_ago(now - 3_600, now), "seen today");
+        assert_eq!(seen_ago(now - day, now), "seen yesterday");
+        assert_eq!(seen_ago(now - 13 * day, now), "seen 13 days ago");
+        assert_eq!(seen_ago(now - 14 * day, now), "seen 2 weeks ago");
+        assert_eq!(seen_ago(now - 59 * day, now), "seen 8 weeks ago");
+        assert_eq!(seen_ago(now - 60 * day, now), "seen 2 months ago");
+        assert_eq!(seen_ago(now - 89 * day, now), "seen 2 months ago");
+        assert_eq!(seen_ago(now - 90 * day, now), "not seen for 3 months");
+        assert_eq!(seen_ago(now - 729 * day, now), "not seen for 24 months");
+        assert_eq!(seen_ago(now - 730 * day, now), "not seen for 2 years");
+        assert_eq!(seen_ago(now + day, now), "seen today", "a clock set back");
+        assert!(!is_stale(now - (STALE_AFTER_DAYS - 1) * day, now));
+        assert!(is_stale(now - STALE_AFTER_DAYS * day, now));
     }
 
     /// After an outage ends, the windowed loss figure is momentum, not the
@@ -8886,7 +9084,7 @@ mod tests {
         s.vitals.cores = vec![12.0, 4.0, 88.0, 3.0];
         s.vitals.mem_total = 24 * 1024 * 1024 * 1024;
         s.vitals.mem_pressure_pct = 68.0;
-        s.vitals.load = (2.8, 2.9, 2.9);
+        s.vitals.load = Some((2.8, 2.9, 2.9));
         s.vitals.thermal = "CPU limited to 70%".into();
         s.vitals.throttled = true;
         s.vitals.power_source = "Battery Power".into();
@@ -8896,18 +9094,16 @@ mod tests {
         // Cores are numbered from 1 for display; index 2 is core 3.
         assert!(out.contains("core 3 88%"));
         assert!(out.contains("68% used"), "pressure, not used/total");
-        // Windows has no load-average concept and sysinfo reports zeros there,
-        // so the row is suppressed rather than rendered as a measured idle.
-        if cfg!(windows) {
-            assert!(
-                !out.contains("load "),
-                "Windows has no load average to show"
-            );
-        } else {
-            assert!(out.contains("2.80 2.90 2.90"));
-        }
+        assert!(out.contains("2.80 2.90 2.90"));
         assert!(out.contains("CPU limited to 70%"));
         assert!(out.contains("Battery Power"));
+
+        // A platform with no load-average concept (Windows) reports none, and
+        // the row is left out rather than rendered as a measured idle machine.
+        s.vitals.load = None;
+        let out = draw(&s, 120, 30);
+        assert!(!out.contains("load "), "no load average to show");
+        assert!(out.contains("68% used"), "the rest of the panel stays");
 
         // Per-core detail is full-screen only; the split view stays a summary.
         assert!(!out.contains("per-core"));
@@ -10022,6 +10218,27 @@ mod tests {
         assert!(out.contains("Cloudflare WARP"));
         assert!(out.contains("Tunnel (VPN)"));
         assert!(out.contains("encapsulated"));
+    }
+
+    /// An unnamed tunnel borrows the one clue there is, the operator of the
+    /// network the traffic comes out of, as seen by the edge; a named one
+    /// does not need it.
+    #[test]
+    fn an_unnamed_tunnel_says_whose_network_it_exits_from() {
+        let mut s = state_with_medium(LinkMedium::Tunnel);
+        s.netinfo.tunnel = Some(String::new());
+        s.netinfo.tunnel_iface = "utun4".to_string();
+        s.edge = Some(crate::app::EdgeInfo {
+            isp: "Datacamp Limited".into(),
+            ..Default::default()
+        });
+        let out = draw(&s, 200, 60);
+        assert!(out.contains("unidentified VPN / tunnel"), "{out}");
+        assert!(out.contains("· exit via Datacamp Limited"), "{out}");
+
+        s.netinfo.tunnel = Some("Cloudflare WARP".to_string());
+        let out = draw(&s, 200, 60);
+        assert!(!out.contains("exit via"), "{out}");
     }
 
     /// WARP's usual shape: `default` still points at Wi-Fi, but 0.0.0.0/1 sends

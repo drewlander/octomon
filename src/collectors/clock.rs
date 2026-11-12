@@ -10,8 +10,9 @@
 //! [`crate::collectors::http`]. Whichever answered most recently is what the
 //! analysis reads.
 
+use parking_lot::Mutex;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
@@ -32,21 +33,27 @@ pub struct NtpReading {
     pub rtt_ms: f64,
 }
 
+/// Whether this collector has anything to do: an empty `ntp_server` turns
+/// it off, and the supervisor then never starts it.
+pub fn enabled(cfg: &crate::config::Config) -> bool {
+    !cfg.ntp_server.trim().is_empty()
+}
+
 pub async fn run(
     state: Arc<Mutex<AppState>>,
     cfg: crate::config::Config,
     changed: Arc<tokio::sync::Notify>,
 ) {
-    let server = cfg.ntp_server.trim().to_string();
-    if server.is_empty() {
+    if !enabled(&cfg) {
         return;
     }
+    let server = cfg.ntp_server.trim().to_string();
     // Let the network settle before the first exchange.
     tokio::time::sleep(Duration::from_secs(4)).await;
     loop {
         let result = consensus(&server).await;
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock();
             match result {
                 Ok(r) => {
                     s.clock.ntp_offset_ms = Some(r.offset_ms);

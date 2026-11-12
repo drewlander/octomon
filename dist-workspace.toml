@@ -42,6 +42,12 @@ post-announce-jobs = ["./windows-installer"]
 # Path is relative to .github/workflows/. Kept outside that directory so
 # GitHub does not try to run this fragment as a workflow in its own right.
 github-build-setup = "../build-setup.yml"
+# SHA-pin release.yml's actions (dist writes each value verbatim after `@`).
+# Bump here and run `dist generate`; never hand-edit release.yml.
+github-action-commits = { "actions/checkout" = "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1", "actions/upload-artifact" = "cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2", "actions/download-artifact" = "9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2" }
 
 [dist.github-custom-runners]
 aarch64-pc-windows-msvc = "windows-11-arm"
+# GitHub retired the macos-14 image in November 2026 (dist 0.32's default for
+# this target); the v0.12.0 release's macOS job was cancelled at scheduling.
+aarch64-apple-darwin = "macos-15"

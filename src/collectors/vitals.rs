@@ -5,7 +5,8 @@
 //! load average, and (on macOS and Windows) whether the OS is holding the
 //! CPU back — which can cap a speed test or an encrypted tunnel.
 
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
@@ -19,7 +20,16 @@ const THERMAL_EVERY: u32 = 30;
 const PROCS_EVERY: u32 = 2;
 
 pub async fn run(state: Arc<Mutex<AppState>>, cfg: Config) {
-    let mut sys = System::new();
+    crate::debug_panic("collector");
+    // sysinfo 0.40 made this fallible. Nothing here can recover from it, so
+    // the panel stays at its zero state and the log says why.
+    let mut sys = match System::new() {
+        Ok(sys) => sys,
+        Err(e) => {
+            crate::errlog::log("vitals", format!("sysinfo unavailable: {e}"));
+            return;
+        }
+    };
     let mut ticker = tokio::time::interval(cfg.sample_interval());
     let mut tick: u32 = 0;
 
@@ -30,7 +40,7 @@ pub async fn run(state: Arc<Mutex<AppState>>, cfg: Config) {
         sys.refresh_memory();
 
         let cpu = sys.global_cpu_usage();
-        let cores: Vec<f32> = sys.cpus().iter().map(|c| c.cpu_usage()).collect();
+        let cores: Vec<f32> = sys.cpus().iter().map(|c| c.usage()).collect();
         let used = sys.used_memory();
         let total = sys.total_memory();
         let available = sys.available_memory();
@@ -47,7 +57,12 @@ pub async fn run(state: Arc<Mutex<AppState>>, cfg: Config) {
         } else {
             0.0
         };
-        let load = System::load_average();
+        // Windows has no load-average concept; sysinfo says so with an error
+        // rather than the zeros it used to report, and the panel shows nothing
+        // rather than a permanently idle machine.
+        let load = System::load_average()
+            .ok()
+            .map(|l| (l.one, l.five, l.fifteen));
 
         // Thermal state changes slowly and costs a subprocess.
         let thermal = if tick.is_multiple_of(THERMAL_EVERY) {
@@ -100,10 +115,10 @@ pub async fn run(state: Arc<Mutex<AppState>>, cfg: Config) {
         } else {
             None
         };
-        let uptime = System::uptime();
+        let uptime = System::uptime().unwrap_or(0);
         tick = tick.wrapping_add(1);
 
-        let mut s = state.lock().unwrap();
+        let mut s = state.lock();
         if let Some((top, own)) = top {
             s.vitals.top_procs = top;
             s.vitals.own = own;
@@ -116,7 +131,7 @@ pub async fn run(state: Arc<Mutex<AppState>>, cfg: Config) {
         s.vitals.mem_pressure_pct = pressure;
         s.vitals.swap_used = sys.used_swap();
         s.vitals.swap_total = sys.total_swap();
-        s.vitals.load = (load.one, load.five, load.fifteen);
+        s.vitals.load = load;
         s.vitals.cpu_hist.push(cpu as f64);
         s.vitals.mem_hist.push(mem_pct);
         s.vitals.pressure_hist.push(pressure as f64);

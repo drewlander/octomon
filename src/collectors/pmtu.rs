@@ -30,8 +30,9 @@
 //! rather than inventing a number. Linux honours `IP_PMTUDISC_DO`. Windows
 //! (`IP_DONTFRAGMENT`) is not wired yet; see TODO.md.
 
+use parking_lot::Mutex;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::app::{AppState, PmtuResult};
@@ -42,19 +43,25 @@ const SETTLE: Duration = Duration::from_secs(8);
 /// Re-probe cadence when nothing changed; MTUs don't move on their own.
 const PERIOD: Duration = Duration::from_secs(30 * 60);
 
+/// Whether this collector has anything to do: an empty `pmtu_probe_host`
+/// turns it off, and the supervisor then never starts it.
+pub fn enabled(cfg: &crate::config::Config) -> bool {
+    !cfg.pmtu_probe_host.trim().is_empty()
+}
+
 pub async fn run(
     state: Arc<Mutex<AppState>>,
     cfg: crate::config::Config,
     changed: Arc<tokio::sync::Notify>,
 ) {
-    let host = cfg.pmtu_probe_host.trim().to_string();
-    if host.is_empty() {
+    if !enabled(&cfg) {
         return;
     }
+    let host = cfg.pmtu_probe_host.trim().to_string();
     loop {
         tokio::time::sleep(SETTLE).await;
         let (iface_mtu, available) = {
-            let s = state.lock().unwrap();
+            let s = state.lock();
             (s.netinfo.mtu, !s.link_lost && !s.netinfo.iface.is_empty())
         };
         // A QUIC-speaking host: the probe relies on the version-negotiation
@@ -70,8 +77,8 @@ pub async fn run(
             }
             Err(_) => (None, None),
         };
-        let v6_applicable = cfg.probe_ipv6
-            && crate::collectors::http::has_global_v6(&state.lock().unwrap().netinfo.ipv6);
+        let v6_applicable =
+            cfg.probe_ipv6 && crate::collectors::http::has_global_v6(&state.lock().netinfo.ipv6);
         let mut deferred = false;
         if available {
             for (target, v6) in [(target4, false), (target6.filter(|_| v6_applicable), true)] {
@@ -111,14 +118,14 @@ async fn measure(
 ) -> bool {
     use crate::verdict::thresholds as th;
     let loss = {
-        let s = state.lock().unwrap();
+        let s = state.lock();
         s.targets
             .iter()
             .find(|t| t.addr == target && t.window.len() >= th::MIN_SAMPLES)
             .map(|t| t.recent_loss_pct(th::RECENT))
     };
     if loss.is_some_and(|l| l >= th::PMTU_LOSS_GATE_PCT) {
-        let mut guard = state.lock().unwrap();
+        let mut guard = state.lock();
         let s: &mut AppState = &mut guard;
         let (slot, err) = if v6 {
             (&s.pmtu6, &mut s.pmtu6_error)
@@ -133,7 +140,7 @@ async fn measure(
     let result = tokio::task::spawn_blocking(move || probe(target, iface_mtu))
         .await
         .unwrap_or_else(|e| Err(e.to_string()));
-    let mut guard = state.lock().unwrap();
+    let mut guard = state.lock();
     let s: &mut AppState = &mut guard;
     let (slot, err) = if v6 {
         (&mut s.pmtu6, &mut s.pmtu6_error)

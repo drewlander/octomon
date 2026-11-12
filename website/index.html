@@ -458,6 +458,29 @@ sudo apt update &amp;&amp; sudo apt install octomon">copy</button>
         </div>
         <div class="install-card">
           <div class="head">
+            <h3>dnf · Fedora, RHEL &amp; openSUSE</h3>
+            <button type="button" class="copy-btn" data-copy="sudo dnf config-manager addrepo --from-repofile=https://octomon.dev/rpm/octomon.repo
+sudo dnf install octomon">copy</button>
+          </div>
+          <div class="cmd"><div class="cmd-scroll">
+            <div class="line"><span class="prompt">$</span><code>sudo dnf config-manager addrepo --from-repofile=https://octomon.dev/rpm/octomon.repo</code></div>
+            <div class="line"><span class="prompt">$</span><code>sudo dnf install octomon</code></div>
+          </div></div>
+          <p class="note">x86_64 and aarch64, same signing key. dnf 4 (RHEL 9): <code>dnf config-manager --add-repo &lt;that url&gt;</code>;
+          openSUSE: <code>zypper addrepo &lt;that url&gt;</code>.</p>
+        </div>
+        <div class="install-card">
+          <div class="head">
+            <h3>nix · flake</h3>
+            <button type="button" class="copy-btn" data-copy="nix run github:securitypedant/octomon">copy</button>
+          </div>
+          <div class="cmd"><div class="cmd-scroll">
+            <div class="line"><span class="prompt">$</span><code>nix run github:securitypedant/octomon</code></div>
+          </div></div>
+          <p class="note">Builds from source. Linux and macOS.</p>
+        </div>
+        <div class="install-card">
+          <div class="head">
             <h3>winget · Windows</h3>
             <button type="button" class="copy-btn" data-copy="winget install SimonThorpe.Octomon">copy</button>
           </div>
@@ -476,9 +499,22 @@ sudo apt update &amp;&amp; sudo apt install octomon">copy</button>
           <div class="cmd"><div class="cmd-scroll">
             <div class="line"><span class="prompt">$</span><code>cargo install octomon</code></div>
           </div></div>
-          <p class="note">Builds from source; needs Rust 1.88+.</p>
+          <p class="note">Builds from source; needs Rust 1.95+.</p>
         </div>
       </div>
+    </div>
+  </section>
+
+  <section id="video">
+    <div class="wrap">
+      <h2>Watch the tour</h2>
+      <iframe class="video-frame"
+        src="https://www.youtube-nocookie.com/embed/ECwBaSvUwfk"
+        title="octomon: intro and tour"
+        loading="lazy"
+        allow="encrypted-media; picture-in-picture; fullscreen"
+        allowfullscreen
+        referrerpolicy="strict-origin-when-cross-origin"></iframe>
     </div>
   </section>
 
@@ -585,19 +621,6 @@ sudo apt update &amp;&amp; sudo apt install octomon">copy</button>
             alt="the analysis overlay: triage ladder, checks, history and findings with evidence">
         </picture>
       </div>
-    </div>
-  </section>
-
-  <section id="video">
-    <div class="wrap">
-      <h2>Watch the tour</h2>
-      <iframe class="video-frame"
-        src="https://www.youtube-nocookie.com/embed/ECwBaSvUwfk"
-        title="octomon: intro and tour"
-        loading="lazy"
-        allow="encrypted-media; picture-in-picture; fullscreen"
-        allowfullscreen
-        referrerpolicy="strict-origin-when-cross-origin"></iframe>
     </div>
   </section>
 
